@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, Response, render_template, request
+from flask import Flask, jsonify, Response, render_template, request, send_from_directory
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.query_api import QueryApi
 from flask_cors import CORS
@@ -17,6 +17,10 @@ query_api = client.query_api()
 @app.route('/')
 def index():
     return render_template('sankey.html')
+
+@app.route('/sankey.js')
+def serve_sankey_js():
+    return send_from_directory('.', 'sankey.js')
 
 @app.after_request
 def add_cors_headers(response):
