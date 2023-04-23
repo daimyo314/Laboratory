@@ -20,7 +20,7 @@ def index():
 
 @app.route('/sankey.js')
 def serve_sankey_js():
-    return send_from_directory('.', 'sankey.js')
+    return send_from_directory('templates', 'sankey.js')
 
 @app.after_request
 def add_cors_headers(response):
