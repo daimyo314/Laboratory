@@ -525,16 +525,21 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
     """
     HTTP handler implementing MCP Streamable HTTP transport.
 
-    POST /mcp  - JSON-RPC endpoint (accepts single messages or batches)
-    GET  /mcp  - SSE stream for server-initiated messages (optional)
+    Accepts /mcp, /sse, and /message paths for compatibility with
+    mcp-remote and various MCP client implementations.
+
+    POST /mcp (or /sse, /message)  - JSON-RPC endpoint
+    GET  /mcp (or /sse)            - SSE stream for server-initiated messages
     """
+
+    _MCP_PATHS = {"/mcp", "/sse", "/message"}
 
     # Shared session state (simple single-session for lightweight use)
     _sessions = {}  # session_id -> {"queue": queue.Queue}
     _lock = threading.Lock()
 
     def do_POST(self):
-        if self.path != "/mcp":
+        if self.path not in self._MCP_PATHS:
             self.send_response(404)
             self.end_headers()
             return
@@ -577,7 +582,7 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_GET(self):
-        if self.path == "/mcp":
+        if self.path in self._MCP_PATHS:
             # SSE endpoint for server-to-client notifications
             # For this lightweight server, we keep it simple: just hold the
             # connection open. Lab_ping is primarily request/response so we
@@ -608,7 +613,7 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_DELETE(self):
-        if self.path == "/mcp":
+        if self.path in self._MCP_PATHS:
             session_id = self.headers.get("Mcp-Session-Id")
             if session_id:
                 with self._lock:
@@ -628,7 +633,7 @@ def mcp_sse(port=DEFAULT_MCP_PORT, bind="0.0.0.0"):
     server = HTTPServer((bind, port), MCPSSEHandler)
     server.daemon_threads = True
     print(f"lab_ping v{VERSION} MCP HTTP server on {bind}:{port}")
-    print(f"  Endpoint: http://{bind}:{port}/mcp")
+    print(f"  Endpoint: http://{bind}:{port}/mcp (also /sse, /message)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
