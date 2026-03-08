@@ -20,8 +20,9 @@ import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DEFAULT_PORT = 7442
+DEFAULT_MCP_PORT = 7443
 SERVICES_DIR = "/etc/lab_ping/services.d"
 
 
@@ -342,6 +343,305 @@ def serve(port=DEFAULT_PORT, bind="0.0.0.0"):
 
 
 # ---------------------------------------------------------------------------
+# MCP (Model Context Protocol) server
+# ---------------------------------------------------------------------------
+# Implements MCP JSON-RPC 2.0 with two transports:
+#   - stdio: zero deps, ideal for SSH-based remote access
+#   - sse:   HTTP+SSE transport for direct network MCP connections
+# Both are stdlib-only, no external packages required.
+
+import threading
+import uuid
+from io import StringIO
+from urllib.parse import urlparse, parse_qs
+
+MCP_TOOLS = [
+    {
+        "name": "get_system_info",
+        "description": (
+            "Get complete system information from this host including "
+            "hostname, OS, CPU, memory, disks, network, uptime, load, "
+            "and running services."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "get_cpu_info",
+        "description": (
+            "Get CPU details: model, core count, temperature, and board "
+            "model (for Raspberry Pi / ARM devices)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "get_memory_info",
+        "description": "Get memory and swap usage in KB.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "get_disk_info",
+        "description": "Get mounted filesystem details and usage.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "get_network_info",
+        "description": "Get network interfaces, IP addresses, MACs, and link state.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "get_services",
+        "description": (
+            "Get running services: custom lab service descriptors from "
+            "/etc/lab_ping/services.d/, Docker containers, and systemd units."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "get_uptime_and_load",
+        "description": "Get system uptime and load averages (1/5/15 min).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+]
+
+TOOL_DISPATCH = {
+    "get_system_info": gather_info,
+    "get_cpu_info": get_cpu_info,
+    "get_memory_info": get_memory_info,
+    "get_disk_info": get_disk_info,
+    "get_network_info": get_network_info,
+    "get_services": get_services,
+    "get_uptime_and_load": lambda: {"uptime": get_uptime(), "load": get_load()},
+}
+
+
+def _mcp_response(id, result):
+    return {"jsonrpc": "2.0", "id": id, "result": result}
+
+
+def _mcp_error(id, code, message):
+    return {"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}
+
+
+def handle_mcp_message(msg):
+    """Process a single MCP JSON-RPC message and return a response (or None for notifications)."""
+    method = msg.get("method")
+    msg_id = msg.get("id")
+    params = msg.get("params", {})
+
+    if method == "initialize":
+        return _mcp_response(msg_id, {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {
+                "tools": {},
+            },
+            "serverInfo": {
+                "name": f"lab_ping@{get_hostname()}",
+                "version": VERSION,
+            },
+        })
+
+    if method == "notifications/initialized":
+        return None  # notification, no response
+
+    if method == "ping":
+        return _mcp_response(msg_id, {})
+
+    if method == "tools/list":
+        return _mcp_response(msg_id, {"tools": MCP_TOOLS})
+
+    if method == "tools/call":
+        tool_name = params.get("name")
+        if tool_name not in TOOL_DISPATCH:
+            return _mcp_error(msg_id, -32602, f"Unknown tool: {tool_name}")
+        try:
+            result = TOOL_DISPATCH[tool_name]()
+            return _mcp_response(msg_id, {
+                "content": [
+                    {"type": "text", "text": json.dumps(result, indent=2)}
+                ],
+            })
+        except Exception as e:
+            return _mcp_response(msg_id, {
+                "content": [
+                    {"type": "text", "text": f"Error: {e}"}
+                ],
+                "isError": True,
+            })
+
+    if msg_id is not None:
+        return _mcp_error(msg_id, -32601, f"Method not found: {method}")
+    return None
+
+
+# --- stdio transport ---
+
+def mcp_stdio():
+    """Run MCP server over stdin/stdout (JSON-RPC, one message per line)."""
+    sys.stderr.write(f"lab_ping v{VERSION} MCP stdio server on {get_hostname()}\n")
+    sys.stderr.flush()
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            resp = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
+            continue
+
+        resp = handle_mcp_message(msg)
+        if resp is not None:
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
+
+
+# --- SSE over HTTP transport ---
+
+class MCPSSEHandler(BaseHTTPRequestHandler):
+    """
+    HTTP handler implementing MCP Streamable HTTP transport.
+
+    Accepts /mcp, /sse, and /message paths for compatibility with
+    mcp-remote and various MCP client implementations.
+
+    POST /mcp (or /sse, /message)  - JSON-RPC endpoint
+    GET  /mcp (or /sse)            - SSE stream for server-initiated messages
+    """
+
+    _MCP_PATHS = {"/mcp", "/sse", "/message"}
+
+    # Shared session state (simple single-session for lightweight use)
+    _sessions = {}  # session_id -> {"queue": queue.Queue}
+    _lock = threading.Lock()
+
+    def do_POST(self):
+        if self.path not in self._MCP_PATHS:
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length).decode()
+
+        try:
+            msg = json.loads(body)
+        except json.JSONDecodeError:
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            err = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}
+            self.wfile.write(json.dumps(err).encode())
+            return
+
+        # Handle initialize - assign session
+        if msg.get("method") == "initialize":
+            session_id = str(uuid.uuid4())
+            with self._lock:
+                self._sessions[session_id] = {"initialized": True}
+        else:
+            session_id = self.headers.get("Mcp-Session-Id")
+
+        resp = handle_mcp_message(msg)
+
+        if resp is not None:
+            payload = json.dumps(resp)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            if msg.get("method") == "initialize" and session_id:
+                self.send_header("Mcp-Session-Id", session_id)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload.encode())
+        else:
+            # Notification - accepted, no content
+            self.send_response(202)
+            self.end_headers()
+
+    def do_GET(self):
+        if self.path in self._MCP_PATHS:
+            # SSE endpoint for server-to-client notifications
+            # For this lightweight server, we keep it simple: just hold the
+            # connection open. Lab_ping is primarily request/response so we
+            # don't push events, but the endpoint exists for protocol compat.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            # Send a keepalive comment, then hold open
+            try:
+                self.wfile.write(b": keepalive\n\n")
+                self.wfile.flush()
+                # Block until client disconnects
+                while True:
+                    time.sleep(30)
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+        elif self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok","mode":"mcp"}')
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_DELETE(self):
+        if self.path in self._MCP_PATHS:
+            session_id = self.headers.get("Mcp-Session-Id")
+            if session_id:
+                with self._lock:
+                    self._sessions.pop(session_id, None)
+            self.send_response(200)
+            self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def mcp_sse(port=DEFAULT_MCP_PORT, bind="0.0.0.0"):
+    """Run MCP server over HTTP with Streamable HTTP transport."""
+    server = HTTPServer((bind, port), MCPSSEHandler)
+    server.daemon_threads = True
+    print(f"lab_ping v{VERSION} MCP HTTP server on {bind}:{port}")
+    print(f"  Endpoint: http://{bind}:{port}/mcp (also /sse, /message)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+        server.server_close()
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -355,14 +655,19 @@ def main():
         "mode",
         nargs="?",
         default="dump",
-        choices=["dump", "serve"],
-        help="'dump' prints info to stdout (default), 'serve' starts HTTP server",
+        choices=["dump", "serve", "mcp", "mcp-sse"],
+        help=(
+            "'dump' prints info to stdout (default), "
+            "'serve' starts HTTP server, "
+            "'mcp' starts MCP stdio server, "
+            "'mcp-sse' starts MCP HTTP/SSE server"
+        ),
     )
     parser.add_argument(
         "-p", "--port",
         type=int,
-        default=DEFAULT_PORT,
-        help=f"HTTP port (default: {DEFAULT_PORT})",
+        default=None,
+        help=f"HTTP port (default: {DEFAULT_PORT} for serve, {DEFAULT_MCP_PORT} for mcp-sse)",
     )
     parser.add_argument(
         "-b", "--bind",
@@ -382,7 +687,11 @@ def main():
     args = parser.parse_args()
 
     if args.mode == "serve":
-        serve(port=args.port, bind=args.bind)
+        serve(port=args.port or DEFAULT_PORT, bind=args.bind)
+    elif args.mode == "mcp":
+        mcp_stdio()
+    elif args.mode == "mcp-sse":
+        mcp_sse(port=args.port or DEFAULT_MCP_PORT, bind=args.bind)
     else:
         data = gather_info()
         indent = None if args.compact else 2
